@@ -241,12 +241,14 @@ contract AgentCommerceHub is Ownable, ReentrancyGuard {
     function reject(uint256 jobId, string calldata reason) external nonReentrant {
         Job storage job = jobs[jobId];
 
-        if (job.status == Status.Open) {
+        Status prevStatus = job.status;
+
+        if (prevStatus == Status.Open) {
             if (msg.sender != job.client) revert Unauthorized();
-        } else if (job.status == Status.Funded || job.status == Status.Submitted) {
+        } else if (prevStatus == Status.Funded || prevStatus == Status.Submitted) {
             if (msg.sender != job.evaluator) revert Unauthorized();
         } else {
-            revert InvalidStatus(job.status, Status.Funded);
+            revert InvalidStatus(prevStatus, Status.Funded);
         }
 
         _hook(jobId, "reject", true);
@@ -254,13 +256,21 @@ contract AgentCommerceHub is Ownable, ReentrancyGuard {
         job.evaluatorNote = reason;
         job.status = Status.Rejected;
 
-        if (job.budget > 0 && IERC20(job.token).balanceOf(address(this)) >= job.budget) {
+        // Refund escrow to client only if funds were actually locked.
+        // Funds are guaranteed present when prevStatus was Funded or Submitted —
+        // fund() pulled them and no other path has released them yet.
+        // No balance check — a silent failure would trap client funds permanently.
+        if (prevStatus == Status.Funded || prevStatus == Status.Submitted) {
             IERC20(job.token).safeTransfer(job.client, job.budget);
         }
 
-        // Auto-rate in ServiceRegistry (bad: 1/5 if submitted, neutral: 3/5 if not)
-        uint8 score = bytes(job.deliverable).length > 0 ? 1 : 3;
-        _autoRate(job, score, string.concat("job rejected: ", reason));
+        // Auto-rate only if job was funded — no rating for Open rejections
+        // (provider never did any work, unfair to penalise reputation).
+        // Bad: 1/5 if deliverable was submitted but rejected. Funded-but-not-submitted: 3/5.
+        if (prevStatus == Status.Funded || prevStatus == Status.Submitted) {
+            uint8 score = prevStatus == Status.Submitted ? 1 : 3;
+            _autoRate(job, score, string.concat("job rejected: ", reason));
+        }
 
         _hook(jobId, "reject", false);
         emit JobRejected(jobId, reason);
@@ -298,8 +308,9 @@ contract AgentCommerceHub is Ownable, ReentrancyGuard {
     function _hook(uint256 jobId, string memory action, bool before) internal {
         address h = hooks[jobId];
         if (h == address(0)) return;
-        try IHook(h).beforeAction(jobId, action) {} catch {}
-        if (!before) {
+        if (before) {
+            try IHook(h).beforeAction(jobId, action) {} catch {}
+        } else {
             try IHook(h).afterAction(jobId, action) {} catch {}
         }
     }
